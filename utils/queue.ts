@@ -6,6 +6,7 @@ export interface Song {
   url: string;
   channelId: string;
   guild: Guild;
+  duration?: number;
 }
 
 export interface Queue {

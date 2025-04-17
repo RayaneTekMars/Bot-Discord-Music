@@ -1,24 +1,23 @@
 import { ChatInputCommandInteraction } from 'discord.js';
 import { SlashCommandBuilder } from '@discordjs/builders';
 import { Command } from '../types/Command';
-import { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus } from '@discordjs/voice';
-import ytdl from '@distube/ytdl-core';
+import { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, NoSubscriberBehavior } from '@discordjs/voice';
+import play from 'play-dl';
 import { getQueue, setQueue, deleteQueue, Song } from '../utils/queue';
-import { getSpotifyTrack, searchYouTube } from '../utils/spotify';
 
-const play: Command = {
+const playCommand: Command = {
   data: new SlashCommandBuilder()
     .setName('play')
     .setDescription('Joue une musique depuis YouTube ou Spotify')
     .addStringOption(option =>
       option.setName('url')
-        .setDescription('L\'URL YouTube ou Spotify de la musique')
+        .setDescription('L\'URL YouTube ou Spotify de la musique ou un terme de recherche')
         .setRequired(true)),
   
   async execute(interaction: ChatInputCommandInteraction) {
     if (!interaction.guild) return;
     
-    const url = interaction.options.getString('url', true);
+    const query = interaction.options.getString('url', true);
     const guildId = interaction.guild.id;
     
     if (!interaction.member || !('voice' in interaction.member)) {
@@ -32,32 +31,71 @@ const play: Command = {
       return;
     }
     
+    await interaction.deferReply();
+    
     try {
-      let song: Song;
+      let songInfo;
       
-      // Vérifier si c'est une URL Spotify
-      if (url.includes('spotify.com')) {
-        const tracks = await getSpotifyTrack(url);
-        const youtubeResults = await Promise.all(tracks.map(track => searchYouTube(track.searchQuery)));
-        
-        // Pour l'instant, on ne prend que la première piste
-        const firstResult = youtubeResults[0];
-        song = {
-          title: firstResult.title,
-          url: firstResult.url,
-          channelId: voiceChannel.id,
-          guild: interaction.guild
-        };
+      // Déterminer le type d'URL (YouTube, Spotify) ou recherche
+      if (play.yt_validate(query) === 'video') {
+        // URL YouTube directe
+        songInfo = await play.video_info(query);
+      } else if (play.yt_validate(query) === 'playlist') {
+        // Playlist YouTube - pour l'instant, on ne prend que la première vidéo
+        const playlist = await play.playlist_info(query);
+        const videos = await playlist.all_videos();
+        if (videos.length === 0) {
+          await interaction.editReply('❌ Aucune vidéo trouvée dans cette playlist.');
+          return;
+        }
+        songInfo = await play.video_info(videos[0].url);
+      } else if (play.sp_validate(query) === 'track') {
+        // Piste Spotify
+        const spotifyInfo = await play.spotify(query);
+        const searched = await play.search(`${spotifyInfo.name} ${('artists' in spotifyInfo) ? spotifyInfo.artists[0]?.name : ''}`, {
+          limit: 1
+        });
+        if (searched.length === 0) {
+          await interaction.editReply('❌ Aucune piste YouTube correspondante trouvée.');
+          return;
+        }
+        songInfo = await play.video_info(searched[0].url);
+      } else if (play.sp_validate(query) === 'album' || play.sp_validate(query) === 'playlist') {
+        // Album ou playlist Spotify - pour l'instant, on ne prend que la première piste
+        const spotifyInfo = await play.spotify(query);
+        if (!('tracks' in spotifyInfo) || !Array.isArray(spotifyInfo.tracks) || spotifyInfo.tracks.length === 0) {
+          await interaction.editReply('❌ Aucune piste trouvée dans cet album/playlist Spotify.');
+          return;
+        }
+        const firstTrack = spotifyInfo.tracks[0];
+        const searched = await play.search(`${firstTrack.name} ${('artists' in firstTrack && Array.isArray(firstTrack.artists)) ? firstTrack.artists[0]?.name : ''}`, {
+          limit: 1
+        });
+        if (searched.length === 0) {
+          await interaction.editReply('❌ Aucune piste YouTube correspondante trouvée.');
+          return;
+        }
+        songInfo = await play.video_info(searched[0].url);
       } else {
-        // URL YouTube
-        const songInfo = await ytdl.getInfo(url);
-        song = {
-          title: songInfo.videoDetails.title,
-          url: url,
-          channelId: voiceChannel.id,
-          guild: interaction.guild
-        };
+        // Recherche YouTube par mots-clés
+        const searched = await play.search(query, {
+          limit: 1
+        });
+        if (searched.length === 0) {
+          await interaction.editReply('❌ Aucun résultat trouvé.');
+          return;
+        }
+        songInfo = await play.video_info(searched[0].url);
       }
+      
+      // Créer l'objet chanson
+      const song: Song = {
+        title: songInfo.video_details.title || 'Titre inconnu',
+        url: songInfo.video_details.url,
+        channelId: voiceChannel.id,
+        guild: interaction.guild,
+        duration: songInfo.video_details.durationInSec
+      };
       
       let queue = getQueue(guildId);
       if (!queue) {
@@ -72,70 +110,99 @@ const play: Command = {
       queue.songs.push(song);
       
       if (queue.songs.length === 1) {
-        playSong(guildId, song);
+        await playSong(guildId, song);
       }
       
-      await interaction.reply(`✅ ${song.title} a été ajoutée à la file d'attente.`);
+      await interaction.editReply(`✅ **${song.title}** a été ajoutée à la file d'attente.`);
     } catch (error) {
       console.error('Erreur lors de la lecture:', error);
       let errorMessage = '❌ Une erreur est survenue lors de la lecture de la musique.';
       
       if (error instanceof Error) {
-        if (error.message.includes('private video')) {
+        if (error.message.includes('private')) {
           errorMessage = '❌ Cette vidéo est privée ou non disponible.';
-        } else if (error.message.includes('age restricted')) {
+        } else if (error.message.includes('age')) {
           errorMessage = '❌ Cette vidéo est restreinte par âge.';
-        } else if (error.message.includes('region restricted')) {
+        } else if (error.message.includes('region')) {
           errorMessage = '❌ Cette vidéo n\'est pas disponible dans votre région.';
-        } else if (error.message.includes('URL Spotify invalide')) {
-          errorMessage = '❌ L\'URL Spotify est invalide.';
-        } else if (error.message.includes('Aucune piste trouvée')) {
-          errorMessage = '❌ Aucune piste trouvée sur Spotify.';
+        } else if (error.message.includes('sign in')) {
+          errorMessage = '❌ Cette vidéo nécessite une connexion pour être visionnée.';
         }
       }
       
-      await interaction.reply(errorMessage);
+      await interaction.editReply(errorMessage);
     }
   },
 };
 
 // Fonction pour jouer une chanson
-function playSong(guildId: string, song: Song) {
+async function playSong(guildId: string, song: Song) {
   const queue = getQueue(guildId);
   if (!queue) return;
   
-  const player = createAudioPlayer();
-  const resource = createAudioResource(ytdl(song.url, { 
-    filter: 'audioonly',
-    quality: 'highestaudio',
-    highWaterMark: 1 << 25,
-    requestOptions: {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'DNT': '1',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1'
+  try {
+    // Créer un lecteur audio avec un comportement défini
+    const player = createAudioPlayer({
+      behaviors: {
+        noSubscriber: NoSubscriberBehavior.Pause,
+      },
+    });
+    
+    // Obtenir le stream avec play-dl
+    const stream = await play.stream(song.url);
+    
+    // Créer la ressource audio avec le stream
+    const resource = createAudioResource(stream.stream, {
+      inputType: stream.type,
+    });
+    
+    // Jouer la ressource
+    player.play(resource);
+    
+    // Créer la connexion vocale
+    const connection = joinVoiceChannel({
+      channelId: song.channelId,
+      guildId: guildId,
+      adapterCreator: song.guild.voiceAdapterCreator
+    });
+    
+    // Abonner la connexion au lecteur
+    connection.subscribe(player);
+    
+    queue.connection = connection;
+    queue.player = player;
+    
+    // Gestionnaire d'événements pour quand la chanson se termine
+    player.on(AudioPlayerStatus.Idle, () => {
+      const currentQueue = getQueue(guildId);
+      if (!currentQueue) return;
+      
+      currentQueue.songs.shift();
+      if (currentQueue.songs.length > 0) {
+        playSong(guildId, currentQueue.songs[0]);
+      } else {
+        connection.destroy();
+        deleteQueue(guildId);
       }
-    }
-  }));
-  
-  player.play(resource);
-  
-  const connection = joinVoiceChannel({
-    channelId: song.channelId,
-    guildId: guildId,
-    adapterCreator: song.guild.voiceAdapterCreator
-  });
-  
-  connection.subscribe(player);
-  
-  queue.connection = connection;
-  queue.player = player;
-  
-  player.on(AudioPlayerStatus.Idle, () => {
+    });
+    
+    // Gestionnaire d'erreur
+    player.on('error', (error) => {
+      console.error('Erreur du lecteur audio:', error);
+      const currentQueue = getQueue(guildId);
+      if (!currentQueue) return;
+      
+      currentQueue.songs.shift();
+      if (currentQueue.songs.length > 0) {
+        playSong(guildId, currentQueue.songs[0]);
+      } else {
+        connection.destroy();
+        deleteQueue(guildId);
+      }
+    });
+  } catch (error) {
+    console.error('Erreur lors de la lecture:', error);
+    
     const currentQueue = getQueue(guildId);
     if (!currentQueue) return;
     
@@ -143,10 +210,12 @@ function playSong(guildId: string, song: Song) {
     if (currentQueue.songs.length > 0) {
       playSong(guildId, currentQueue.songs[0]);
     } else {
-      connection.destroy();
+      if (currentQueue.connection) {
+        currentQueue.connection.destroy();
+      }
       deleteQueue(guildId);
     }
-  });
+  }
 }
 
-export default play;
+export default playCommand;
